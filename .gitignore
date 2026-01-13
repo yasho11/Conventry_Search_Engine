@@ -1,0 +1,8 @@
+# Ignore data files
+data/
+
+# Ignore logs
+logs/
+
+# Ignore Python cache
+__pycache__/
