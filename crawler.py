@@ -1,5 +1,5 @@
 """
-Enhanced web crawler with robots.txt compliance
+Enhanced web crawler with abstract extraction from publication pages
 """
 import time
 import re
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class EnhancedCrawler:
-    """Enhanced web crawler with robots.txt compliance and polite crawling"""
+    """Enhanced web crawler with two-level crawling for full abstracts"""
     
     def __init__(self, callback=None):
         """
@@ -41,10 +41,10 @@ class EnhancedCrawler:
         # Remove emoji characters for Windows compatibility
         clean_msg = msg.encode('ascii', 'ignore').decode('ascii')
         if not clean_msg.strip():
-            clean_msg = msg  # Keep original if completely stripped
+            clean_msg = msg
         logger.info(clean_msg)
         if self.callback:
-            self.callback(msg)  # GUI can handle unicode
+            self.callback(msg)
     
     def init_driver(self):
         """Initialize Selenium WebDriver with optimized options"""
@@ -74,32 +74,29 @@ class EnhancedCrawler:
             except:
                 pass
     
-    def crawl_department(self, base_url, max_authors=None):
+    def crawl_department(self, base_url, max_publications=None):
         """
-        Crawl department and extract publications with proper author links
+        Crawl department publications with full abstract extraction
         
         Args:
             base_url: Starting URL for crawling
-            max_authors: Maximum number of authors to crawl (None = unlimited)
+            max_publications: Maximum publications to crawl (None = unlimited)
             
         Returns:
-            List of publication dictionaries
+            List of publication dictionaries with full abstracts
         """
-        if max_authors is None:
-            max_authors = config.MAX_AUTHORS_TO_CRAWL
+        if max_publications is None:
+            max_publications = config.MAX_AUTHORS_TO_CRAWL * 10  # Estimate
         
         self.log("="*80)
-        self.log("Starting Enhanced Crawler with Robots.txt Compliance")
+        self.log("Enhanced Crawler - Full Abstract Extraction")
         self.log("="*80)
         
         # Check robots.txt
         if not self.robots_checker.can_fetch(base_url):
-            self.log("[WARNING] Robots.txt disallows crawling this URL")
-            self.log("[INFO] However, the URL might be allowed. Checking actual rules...")
-            # Let's proceed anyway since robots.txt might just block query params
-            self.log("[INFO] Proceeding with crawl (base URL without params is usually allowed)")
+            self.log("[WARNING] Robots.txt check failed - proceeding anyway")
         else:
-            self.log("[OK] Robots.txt allows crawling this URL")
+            self.log("[OK] Robots.txt allows crawling")
         
         crawl_delay = self.robots_checker.get_effective_delay(base_url)
         self.log(f"Using crawl delay: {crawl_delay} seconds")
@@ -107,54 +104,30 @@ class EnhancedCrawler:
         self.init_driver()
         
         try:
-            # Fetch department page
-            self.log(f"\n📄 Fetching department page: {base_url}")
-            self.driver.get(base_url)
-            time.sleep(crawl_delay)
+            # Try multiple approaches to get publications
+            publications_found = False
             
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            # Approach 1: Get publications from organization publications page
+            pub_list_url = base_url.rstrip('/') + '/publications/'
+            self.log(f"\n[Method 1] Trying publications list: {pub_list_url}")
             
-            # Extract author profile links
-            author_links = self.extract_author_links(soup, base_url)
-            self.log(f"✓ Found {len(author_links)} author profiles")
+            if self.robots_checker.can_fetch(pub_list_url):
+                pubs = self.crawl_publications_list(pub_list_url, crawl_delay, max_publications)
+                if pubs:
+                    self.publications.extend(pubs)
+                    publications_found = True
+                    self.log(f"[OK] Found {len(pubs)} publications from list page")
             
-            # Limit number of authors
-            author_links = author_links[:max_authors]
-            self.log(f"📊 Will crawl {len(author_links)} authors (max: {max_authors})")
-            
-            # Crawl each author's profile
-            for idx, author_link in enumerate(author_links, 1):
-                self.log(f"\n[{idx}/{len(author_links)}] Crawling author: {author_link}")
-                
-                try:
-                    # Polite delay
-                    time.sleep(crawl_delay)
-                    
-                    self.driver.get(author_link)
-                    time.sleep(2)
-                    
-                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-                    
-                    # Extract author info
-                    author_name = self.extract_author_name(soup)
-                    
-                    # Extract publications
-                    pubs = self.extract_publications_from_profile(soup, author_link, author_name)
-                    
-                    if pubs:
-                        self.publications.extend(pubs)
-                        self.log(f"  ✓ Extracted {len(pubs)} publications from {author_name}")
-                    else:
-                        self.log(f"  → No publications found")
-                    
-                except Exception as e:
-                    self.log(f"  ✗ Error: {str(e)}")
-                    logger.error(f"Error crawling {author_link}: {e}", exc_info=True)
-                    continue
+            # Approach 2: If no publications, crawl author profiles
+            if not publications_found:
+                self.log(f"\n[Method 2] Trying author profiles from: {base_url}")
+                pubs = self.crawl_via_authors(base_url, crawl_delay, max_publications)
+                if pubs:
+                    self.publications.extend(pubs)
             
             self.log(f"\n{'='*80}")
-            self.log(f"✓ Crawling completed successfully!")
-            self.log(f"📚 Total publications found: {len(self.publications)}")
+            self.log(f"[COMPLETE] Crawling completed!")
+            self.log(f"[TOTAL] {len(self.publications)} publications with abstracts")
             self.log(f"{'='*80}\n")
             
             return self.publications
@@ -162,20 +135,266 @@ class EnhancedCrawler:
         finally:
             self.close_driver()
     
-    def extract_author_links(self, soup, base_url):
+    def crawl_publications_list(self, pub_list_url, crawl_delay, max_pubs):
         """
-        Extract all person/author profile links
+        Crawl publications from organization's publications list page
         
         Args:
-            soup: BeautifulSoup object
-            base_url: Base URL for resolving relative links
+            pub_list_url: URL of publications list
+            crawl_delay: Delay between requests
+            max_pubs: Maximum publications to crawl
             
         Returns:
-            List of author profile URLs
+            List of publication dictionaries
         """
+        publications = []
+        
+        try:
+            self.log(f"Fetching publications list...")
+            self.driver.get(pub_list_url)
+            time.sleep(crawl_delay)
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # Find all publication items
+            pub_items = soup.find_all('li', class_=re.compile('list-result-item'))
+            
+            if not pub_items:
+                self.log("[WARNING] No publication items found on list page")
+                return publications
+            
+            self.log(f"[OK] Found {len(pub_items)} publication entries")
+            
+            # Extract publication links
+            pub_links = []
+            for item in pub_items[:max_pubs]:
+                # Find the title link
+                title_link = item.find('h3', class_='title')
+                if title_link:
+                    link = title_link.find('a', href=True)
+                    if link:
+                        full_url = urljoin(pub_list_url, link['href'])
+                        if full_url not in self.visited_urls:
+                            pub_links.append(full_url)
+                            self.visited_urls.add(full_url)
+            
+            self.log(f"[OK] Extracted {len(pub_links)} unique publication links")
+            self.log(f"[INFO] Will crawl {min(len(pub_links), max_pubs)} publications for abstracts")
+            
+            # Crawl each publication for full details
+            for idx, pub_link in enumerate(pub_links[:max_pubs], 1):
+                self.log(f"\n[{idx}/{len(pub_links[:max_pubs])}] Crawling: {pub_link}")
+                
+                try:
+                    time.sleep(crawl_delay)
+                    
+                    pub_data = self.extract_publication_details(pub_link)
+                    
+                    if pub_data and pub_data.get('abstract'):
+                        publications.append(pub_data)
+                        abstract_preview = pub_data['abstract'][:100] + "..." if len(pub_data['abstract']) > 100 else pub_data['abstract']
+                        self.log(f"  [OK] Title: {pub_data['title'][:60]}...")
+                        self.log(f"  [OK] Abstract: {abstract_preview}")
+                    elif pub_data:
+                        publications.append(pub_data)
+                        self.log(f"  [WARNING] No abstract found, but saved publication")
+                    else:
+                        self.log(f"  [ERROR] Failed to extract publication data")
+                    
+                except Exception as e:
+                    self.log(f"  [ERROR] {str(e)}")
+                    logger.error(f"Error crawling {pub_link}: {e}", exc_info=True)
+                    continue
+            
+        except Exception as e:
+            self.log(f"[ERROR] Failed to crawl publications list: {str(e)}")
+            logger.error(f"Publications list crawl error: {e}", exc_info=True)
+        
+        return publications
+    
+    def extract_publication_details(self, pub_url):
+        """
+        Extract full publication details including abstract from publication page
+        
+        Args:
+            pub_url: URL of publication page
+            
+        Returns:
+            Publication dictionary with full details
+        """
+        try:
+            self.driver.get(pub_url)
+            time.sleep(2)
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            pub_data = {
+                'title': '',
+                'authors': [],
+                'year': 'N/A',
+                'abstract': '',
+                'keywords': [],
+                'publication_link': pub_url,
+                'profile_link': '',
+                'author_profile_name': '',
+                'crawled_at': datetime.now().isoformat()
+            }
+            
+            # Extract title from h1
+            title_elem = soup.find('h1')
+            if title_elem:
+                pub_data['title'] = title_elem.get_text(strip=True)
+            
+            # Extract authors
+            authors_elem = soup.find('p', class_='relations persons')
+            if authors_elem:
+                # Get all text and author links
+                author_links = authors_elem.find_all('a', class_='person')
+                if author_links:
+                    pub_data['authors'] = [a.get_text(strip=True) for a in author_links]
+                    # Get first author's profile link
+                    pub_data['profile_link'] = urljoin(pub_url, author_links[0]['href'])
+                    pub_data['author_profile_name'] = author_links[0].get_text(strip=True)
+                else:
+                    # Fallback: parse text
+                    authors_text = authors_elem.get_text(strip=True)
+                    pub_data['authors'] = [a.strip() for a in authors_text.split(',')]
+            
+            # Extract year from publication date
+            date_elem = soup.find('span', class_='date')
+            if date_elem:
+                date_text = date_elem.get_text(strip=True)
+                year_match = re.search(r'(19|20)\d{2}', date_text)
+                if year_match:
+                    pub_data['year'] = year_match.group()
+            
+            # Extract abstract - THIS IS THE KEY PART!
+            abstract_section = soup.find('h2', string=re.compile('Abstract', re.I))
+            if abstract_section:
+                # Find the next div with class 'textblock'
+                abstract_div = abstract_section.find_next('div', class_='textblock')
+                if abstract_div:
+                    # Get text and clean up
+                    abstract_text = abstract_div.get_text(separator=' ', strip=True)
+                    # Remove extra whitespace and line breaks
+                    abstract_text = re.sub(r'\s+', ' ', abstract_text)
+                    pub_data['abstract'] = abstract_text.strip()
+            
+            # Fallback: look for any div with rendering_abstractportal class
+            if not pub_data['abstract']:
+                abstract_div = soup.find('div', class_=re.compile('abstractportal'))
+                if abstract_div:
+                    textblock = abstract_div.find('div', class_='textblock')
+                    if textblock:
+                        abstract_text = textblock.get_text(separator=' ', strip=True)
+                        abstract_text = re.sub(r'\s+', ' ', abstract_text)
+                        pub_data['abstract'] = abstract_text.strip()
+            
+            # Extract keywords
+            keywords_section = soup.find('h2', string=re.compile('Keywords', re.I))
+            if keywords_section:
+                keywords_list = keywords_section.find_next('ul', class_='keywords')
+                if keywords_list:
+                    keyword_items = keywords_list.find_all('li')
+                    pub_data['keywords'] = [k.get_text(strip=True) for k in keyword_items]
+            
+            return pub_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting publication details from {pub_url}: {e}", exc_info=True)
+            return None
+    
+    def crawl_via_authors(self, base_url, crawl_delay, max_pubs):
+        """
+        Fallback: Crawl publications via author profiles
+        
+        Args:
+            base_url: Base organization URL
+            crawl_delay: Delay between requests
+            max_pubs: Maximum publications to crawl
+            
+        Returns:
+            List of publications
+        """
+        publications = []
+        
+        try:
+            self.log(f"Fetching author list from: {base_url}")
+            self.driver.get(base_url)
+            time.sleep(crawl_delay)
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # Extract author links
+            author_links = self.extract_author_links(soup, base_url)
+            self.log(f"[OK] Found {len(author_links)} author profiles")
+            
+            # Limit authors
+            max_authors = min(len(author_links), config.MAX_AUTHORS_TO_CRAWL)
+            self.log(f"[INFO] Will crawl {max_authors} authors")
+            
+            # Track total publications
+            total_found = 0
+            
+            # Crawl each author
+            for idx, author_link in enumerate(author_links[:max_authors], 1):
+                if total_found >= max_pubs:
+                    self.log(f"[LIMIT] Reached maximum publications ({max_pubs})")
+                    break
+                
+                self.log(f"\n[{idx}/{max_authors}] Author: {author_link}")
+                
+                try:
+                    time.sleep(crawl_delay)
+                    
+                    self.driver.get(author_link)
+                    time.sleep(2)
+                    
+                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    author_name = self.extract_author_name(soup)
+                    
+                    # Get publication links from author page
+                    pub_links = self.extract_publication_links_from_author(soup, author_link)
+                    
+                    if pub_links:
+                        self.log(f"  [OK] Found {len(pub_links)} publications")
+                        
+                        # Crawl each publication
+                        for pub_link in pub_links[:max(1, max_pubs - total_found)]:
+                            try:
+                                time.sleep(crawl_delay)
+                                pub_data = self.extract_publication_details(pub_link)
+                                
+                                if pub_data:
+                                    # Set author info if not already set
+                                    if not pub_data['author_profile_name']:
+                                        pub_data['author_profile_name'] = author_name
+                                        pub_data['profile_link'] = author_link
+                                    
+                                    publications.append(pub_data)
+                                    total_found += 1
+                                    self.log(f"    [OK] Added: {pub_data['title'][:50]}...")
+                                    
+                            except Exception as e:
+                                self.log(f"    [ERROR] {str(e)}")
+                                continue
+                    else:
+                        self.log(f"  [WARNING] No publications found")
+                    
+                except Exception as e:
+                    self.log(f"  [ERROR] {str(e)}")
+                    continue
+            
+        except Exception as e:
+            self.log(f"[ERROR] Author crawling failed: {str(e)}")
+            logger.error(f"Author crawl error: {e}", exc_info=True)
+        
+        return publications
+    
+    def extract_author_links(self, soup, base_url):
+        """Extract author profile links"""
         author_links = set()
         
-        # Patterns to match author/person URLs
         patterns = [
             r'/en/persons/[\w-]+',
             r'/persons/[\w-]+',
@@ -190,20 +409,10 @@ class EnhancedCrawler:
                     if config.BASE_DOMAIN in full_url:
                         author_links.add(full_url)
         
-        logger.info(f"Found {len(author_links)} unique author links")
         return list(author_links)
     
     def extract_author_name(self, soup):
-        """
-        Extract author name from profile page
-        
-        Args:
-            soup: BeautifulSoup object
-            
-        Returns:
-            Author name string
-        """
-        # Try various selectors
+        """Extract author name from profile page"""
         name_elem = (
             soup.find('h1') or 
             soup.find('h2') or 
@@ -215,104 +424,28 @@ class EnhancedCrawler:
         
         return 'Unknown Author'
     
-    def extract_publications_from_profile(self, soup, profile_link, author_name):
-        """
-        Extract publications from author profile page
+    def extract_publication_links_from_author(self, soup, author_url):
+        """Extract publication links from author profile"""
+        pub_links = []
         
-        Args:
-            soup: BeautifulSoup object
-            profile_link: Author profile URL
-            author_name: Author's name
-            
-        Returns:
-            List of publication dictionaries
-        """
-        publications = []
-        
-        # Look for publication containers
+        # Find publication containers
         pub_containers = (
-            soup.find_all('article') or
-            soup.find_all('div', class_=re.compile('publication', re.I)) or
-            soup.find_all('li', class_=re.compile('publication', re.I))
+            soup.find_all('h3', class_='title') or
+            soup.find_all('a', href=re.compile(r'/en/publications/'))
         )
         
         for container in pub_containers:
-            try:
-                pub_data = self.parse_publication(container, profile_link, author_name)
-                if pub_data and pub_data['title']:
-                    publications.append(pub_data)
-            except Exception as e:
-                logger.warning(f"Error parsing publication: {e}")
-                continue
-        
-        return publications
-    
-    def parse_publication(self, container, profile_link, author_name):
-        """
-        Parse individual publication element
-        
-        Args:
-            container: BeautifulSoup element containing publication
-            profile_link: Author profile URL
-            author_name: Author's name
+            if container.name == 'h3':
+                link = container.find('a', href=True)
+            else:
+                link = container
             
-        Returns:
-            Publication dictionary
-        """
-        pub_data = {
-            'title': '',
-            'authors': [],
-            'year': 'N/A',
-            'abstract': '',
-            'keywords': [],
-            'publication_link': '',
-            'profile_link': profile_link,
-            'author_profile_name': author_name,
-            'crawled_at': datetime.now().isoformat()
-        }
+            if link and link.get('href'):
+                href = link['href']
+                if '/publications/' in href:
+                    full_url = urljoin(author_url, href)
+                    if full_url not in self.visited_urls:
+                        pub_links.append(full_url)
+                        self.visited_urls.add(full_url)
         
-        # Extract title
-        title_elem = container.find(['h3', 'h4', 'h2', 'a'])
-        if title_elem:
-            pub_data['title'] = title_elem.get_text(strip=True)
-        
-        # Extract full text
-        full_text = container.get_text(' ')
-        
-        # Extract year
-        year_match = re.search(r'(19|20)\d{2}', full_text)
-        if year_match:
-            pub_data['year'] = year_match.group()
-        
-        # Extract authors
-        authors_text = container.get_text()
-        author_pattern = r'(?:by|authors?:)\s*(.+?)(?:\d{4}|abstract|keyword|publication type)'
-        author_match = re.search(author_pattern, authors_text, re.IGNORECASE | re.DOTALL)
-        
-        if author_match:
-            authors_str = author_match.group(1).strip()
-            pub_data['authors'] = [a.strip() for a in authors_str.split(',')]
-        else:
-            pub_data['authors'] = [author_name]
-        
-        # Extract abstract
-        abstract_elem = container.find(string=re.compile('abstract', re.I))
-        if abstract_elem:
-            parent = abstract_elem.find_parent()
-            if parent:
-                pub_data['abstract'] = parent.get_text(strip=True)[:500]
-        
-        # Extract publication link
-        link_elem = container.find('a', href=re.compile(r'/en/publications/', re.I))
-        if link_elem and link_elem.get('href'):
-            pub_data['publication_link'] = urljoin(profile_link, link_elem['href'])
-        else:
-            # Fallback
-            a_tags = container.find_all('a', href=True)
-            for a in a_tags:
-                href = a.get('href', '')
-                if 'publication' in href or 'research' in href:
-                    pub_data['publication_link'] = urljoin(profile_link, href)
-                    break
-        
-        return pub_data
+        return pub_links
